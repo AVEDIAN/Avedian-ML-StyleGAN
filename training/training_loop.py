@@ -16,10 +16,13 @@ import PIL.Image
 import numpy as np
 import torch
 import dnnlib
+from training import conector
 from torch_utils import misc
 from torch_utils import training_stats
 from torch_utils.ops import conv2d_gradfix
 from torch_utils.ops import grid_sample_gradfix
+import re
+
 
 import legacy
 from metrics import metric_main
@@ -118,6 +121,8 @@ def training_loop(
     allow_tf32              = False,    # Enable torch.backends.cuda.matmul.allow_tf32 and torch.backends.cudnn.allow_tf32?
     abort_fn                = None,     # Callback function for determining whether to abort training. Must return consistent results across ranks.
     progress_fn             = None,     # Callback function for updating training progress. Called for all ranks.
+    salida                  = 'prueba1', # S3 prefix path for the uploaded model
+
 ):
     # Initialize.
     start_time = time.time()
@@ -133,6 +138,7 @@ def training_loop(
     # Load training set.
     if rank == 0:
         print('Loading training set...')
+        conector.register_exit_handlers(salida)
     training_set = dnnlib.util.construct_class_by_name(**training_set_kwargs) # subclass of training.dataset.Dataset
     training_set_sampler = misc.InfiniteSampler(dataset=training_set, rank=rank, num_replicas=num_gpus, seed=random_seed)
     training_set_iterator = iter(torch.utils.data.DataLoader(dataset=training_set, sampler=training_set_sampler, batch_size=batch_size//num_gpus, **data_loader_kwargs))
@@ -152,13 +158,32 @@ def training_loop(
     G_ema = copy.deepcopy(G).eval()
 
     # Resume from existing pickle.
+    start_kimg = 0
     if (resume_pkl is not None) and (rank == 0):
         print(f'Resuming from "{resume_pkl}"')
         with dnnlib.util.open_url(resume_pkl) as f:
             resume_data = legacy.load_network_pkl(f)
         for name, module in [('G', G), ('D', D), ('G_ema', G_ema)]:
             misc.copy_params_and_buffers(resume_data[name], module, require_all=False)
-
+            
+        # First try to extract kimg from the original filename
+        match = re.search(r'network-snapshot-(\d+)\.pkl', os.path.basename(resume_pkl))
+        
+        # If that fails, try to extract it from the original path (for S3 URIs)
+        if not match and 'resume_pkl' in locals() and isinstance(resume_pkl, str):
+            match = re.search(r'network-snapshot-(\d+)\.pkl', resume_pkl)
+        
+        # If that still fails, try to find any sequence of digits that might be the kimg
+        if not match and 'resume_pkl' in locals() and isinstance(resume_pkl, str):
+            match = re.search(r'(\d{4,6})', resume_pkl)  # Look for 4-6 digit sequences
+            
+        if match:
+            # Convert the numeric part to kimg (thousands of images)
+            start_kimg = int(match.group(1))
+            print(f'Resuming training from kimg {start_kimg}')
+        else:
+            print('Could not determine starting kimg from filename, starting from 0')
+     
     # Print network summary tables.
     if rank == 0:
         z = torch.empty([batch_gpu, G.z_dim], device=device)
@@ -243,16 +268,16 @@ def training_loop(
 
     # Train.
     if rank == 0:
-        print(f'Training for {total_kimg} kimg...')
+        print(f'Training from kimg {start_kimg} to {total_kimg} kimg...')
         print()
-    cur_nimg = 0
-    cur_tick = 0
+    cur_nimg = start_kimg * 1000  # Convert kimg to images
+    cur_tick = start_kimg // kimg_per_tick  # Calculate tick based on kimg_per_tick
     tick_start_nimg = cur_nimg
     tick_start_time = time.time()
     maintenance_time = tick_start_time - start_time
     batch_idx = 0
     if progress_fn is not None:
-        progress_fn(0, total_kimg)
+        progress_fn(start_kimg, total_kimg)
     while True:
 
         # Fetch training data.
@@ -363,8 +388,10 @@ def training_loop(
                 del module # conserve memory
             snapshot_pkl = os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl')
             if rank == 0:
+                conector.subir_s3(f'{cur_nimg//1000:06d}', salida_prefix=salida)
                 with open(snapshot_pkl, 'wb') as f:
                     pickle.dump(snapshot_data, f)
+
 
         # Evaluate metrics.
         if (snapshot_data is not None) and (len(metrics) > 0):
@@ -405,16 +432,23 @@ def training_loop(
         if progress_fn is not None:
             progress_fn(cur_nimg // 1000, total_kimg)
 
+        if (cur_tick % network_snapshot_ticks == 0):
+            conector.subir_s3(f'{cur_nimg//1000:06d}', salida_prefix=salida)
+
         # Update state.
         cur_tick += 1
         tick_start_nimg = cur_nimg
         tick_start_time = time.time()
         maintenance_time = tick_start_time - tick_end_time
+
+
+        
         if done:
             break
 
     # Done.
     if rank == 0:
+        conector.upload_final_results(salida)
         print()
         print('Exiting...')
 

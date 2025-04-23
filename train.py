@@ -16,11 +16,12 @@ import json
 import tempfile
 import torch
 import dnnlib
-
 from training import training_loop
 from metrics import metric_main
 from torch_utils import training_stats
 from torch_utils import custom_ops
+import boto3
+import urllib.parse
 
 #----------------------------------------------------------------------------
 
@@ -28,6 +29,33 @@ class UserError(Exception):
     pass
 
 #----------------------------------------------------------------------------
+
+def download_from_s3(s3_uri):
+    """
+    Download a file from an S3 URI to a local temporary file.
+    Returns the path to the downloaded file.
+    """
+    print(f'Downloading from S3: {s3_uri}')
+    parsed = urllib.parse.urlparse(s3_uri)
+    if not parsed.netloc or not parsed.path:
+        raise UserError(f'Invalid S3 URI: {s3_uri}')
+    
+    bucket = parsed.netloc
+    key = parsed.path.lstrip('/')
+    
+    # Create a temporary file to store the downloaded model
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pkl')
+    temp_file.close()
+    local_path = temp_file.name
+    
+    try:
+        s3_client = boto3.client('s3')
+        s3_client.download_file(bucket, key, local_path)
+        print(f'Successfully downloaded to {local_path}')
+        return local_path
+    except Exception as e:
+        os.unlink(local_path)  # Clean up the temporary file
+        raise UserError(f'Failed to download from S3: {str(e)}')
 
 def setup_training_loop_kwargs(
     # General options (not included in desc).
@@ -64,6 +92,8 @@ def setup_training_loop_kwargs(
     allow_tf32 = None, # Allow PyTorch to use TF32 for matmul and convolutions: <bool>, default = False
     nobench    = None, # Disable cuDNN benchmarking: <bool>, default = False
     workers    = None, # Override number of DataLoader workers: <int>, default = 3
+    # Additional parameters
+    salida     = None, # S3 prefix for output, default = 'prueba1'
 ):
     args = dnnlib.EasyDict()
 
@@ -104,6 +134,12 @@ def setup_training_loop_kwargs(
 
     assert data is not None
     assert isinstance(data, str)
+
+    if salida is None:
+        salida = 'prueba1'
+    assert isinstance(salida, str)
+    args.salida = salida
+    
     args.training_set_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=data, use_labels=True, max_size=None, xflip=False)
     args.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=3, prefetch_factor=2)
     try:
@@ -305,10 +341,15 @@ def setup_training_loop_kwargs(
         desc += '-noresume'
     elif resume in resume_specs:
         desc += f'-resume{resume}'
-        args.resume_pkl = resume_specs[resume] # predefined url
+        args.resume_pkl = resume_specs[resume]  # predefined url
+    elif resume.startswith('s3://'):
+        desc += '-resumecustom'
+        # Download the file from S3 and use the local path
+        local_path = download_from_s3(resume)
+        args.resume_pkl = local_path
     else:
         desc += '-resumecustom'
-        args.resume_pkl = resume # custom path or url
+        args.resume_pkl = resume  # custom path or url
 
     if resume != 'noresume':
         args.ada_kimg = 100 # make ADA react faster at the beginning
@@ -435,6 +476,10 @@ class CommaSeparatedList(click.ParamType):
 @click.option('--allow-tf32', help='Allow PyTorch to use TF32 internally', type=bool, metavar='BOOL')
 @click.option('--workers', help='Override number of DataLoader workers', type=int, metavar='INT')
 
+# Add a new parameter for salida
+@click.option('--salida', help='S3 prefix for output files [default: prueba1]', type=str, metavar='STR')
+
+
 def main(ctx, outdir, dry_run, **config_kwargs):
     """Train a GAN using the techniques described in the paper
     "Training Generative Adversarial Networks with Limited Data".
@@ -510,6 +555,7 @@ def main(ctx, outdir, dry_run, **config_kwargs):
     print(f'Image resolution:   {args.training_set_kwargs.resolution}')
     print(f'Conditional model:  {args.training_set_kwargs.use_labels}')
     print(f'Dataset x-flips:    {args.training_set_kwargs.xflip}')
+    
     print()
 
     # Dry run?
@@ -531,7 +577,6 @@ def main(ctx, outdir, dry_run, **config_kwargs):
             subprocess_fn(rank=0, args=args, temp_dir=temp_dir)
         else:
             torch.multiprocessing.spawn(fn=subprocess_fn, args=(args, temp_dir), nprocs=args.num_gpus)
-
 #----------------------------------------------------------------------------
 
 if __name__ == "__main__":
